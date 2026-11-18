@@ -15,6 +15,7 @@ import org.bukkit.Location;
 import org.bukkit.Sound;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Item;
@@ -27,6 +28,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerTeleportEvent.TeleportCause;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 
 import java.net.URI;
@@ -55,6 +57,8 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     private final Map<UUID, List<ItemStack>> guardados = new HashMap<>();
     private final Set<UUID> ignorados = new HashSet<>();
     private Item objetivoItem;
+    private final List<ArmorStand> burbujas = new ArrayList<>();
+    private BukkitTask tareaBurbuja;
     private int intentos;
     private final Deque<JsonObject> history = new ArrayDeque<>(); // solo hilo principal
     private final AtomicBoolean busy = new AtomicBoolean(false);
@@ -78,6 +82,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         // Solo limpia lo que creó este plugin (registro propio, no toca el de Citizens)
         Bukkit.getScheduler().cancelTasks(this);
         devolverTodo();
+        quitarBurbuja();
         if (npc != null) npc.destroy();
         if (registry != null) registry.deregisterAll();
     }
@@ -88,10 +93,21 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
 
     private void spawnNpc(Location loc) {
         devolverTodo();
+        quitarBurbuja();
         if (npc != null) npc.destroy();
         npc = registry.createNPC(EntityType.PLAYER, nombre());
         npc.getNavigator().getDefaultParameters().range(64f).distanceMargin(2.5);
         net.citizensnpcs.trait.LookClose lc = npc.getOrAddTrait(net.citizensnpcs.trait.LookClose.class); lc.lookClose(true); lc.setRange(8);
+        String skin = getConfig().getString("skin", "");
+        String textura = getConfig().getString("skin-textura", "");
+        String firma = getConfig().getString("skin-firma", "");
+        if (textura != null && !textura.isBlank() && firma != null && !firma.isBlank()) {
+            // Skin propia (generada en mineskin.org a partir de una imagen o URL)
+            npc.getOrAddTrait(net.citizensnpcs.trait.SkinTrait.class)
+                    .setSkinPersistent("panchito", firma.trim(), textura.trim());
+        } else if (skin != null && !skin.isBlank()) {
+            npc.getOrAddTrait(net.citizensnpcs.trait.SkinTrait.class).setSkinName(skin.trim());
+        }
         npc.spawn(loc);
         mode = "quieto";
     }
@@ -108,6 +124,11 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         String user = p.getName();
         Bukkit.getScheduler().runTask(this, () -> {
             if (npc == null || !npc.isSpawned()) return;
+            // Solo te oye si estás cerca (como si hablaras con él en persona)
+            double radio = getConfig().getDouble("radio-hablar", 20);
+            Entity ne = npc.getEntity();
+            if (!p.getWorld().equals(ne.getWorld())
+                    || p.getLocation().distanceSquared(ne.getLocation()) > radio * radio) return;
             if (!busy.compareAndSet(false, true)) return;
             preguntar(user, msg, estado(p), uid);
         });
@@ -219,8 +240,73 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         });
     }
 
+    // Panchito "habla" con una burbuja flotante sobre su cabeza (no sale en el chat).
+    // Solo la ven los jugadores que estén cerca de él.
     private void hablar(String texto) {
-        Bukkit.broadcast(Component.text("<" + nombre() + "> " + texto));
+        getLogger().info("[" + nombre() + "] " + texto);
+        if (npc == null || !npc.isSpawned()) return;
+        quitarBurbuja();
+        List<String> lineas = dividir(texto.replaceAll("\\s+", " ").trim(), 30);
+        final int n = lineas.size();
+        if (n == 0) return;
+        final double[] alturas = new double[n];
+        Location base = npc.getEntity().getLocation();
+        for (int i = 0; i < n; i++) {
+            alturas[i] = 2.0 + (n - 1 - i) * 0.28;
+            ArmorStand as = base.getWorld().spawn(base.clone().add(0, alturas[i], 0), ArmorStand.class, a -> {
+                a.setInvisible(true);
+                a.setMarker(true);
+                a.setSmall(true);
+                a.setGravity(false);
+                a.setSilent(true);
+                a.setInvulnerable(true);
+                a.setPersistent(false);
+                a.setCustomNameVisible(true);
+            });
+            as.customName(Component.text(lineas.get(i)));
+            burbujas.add(as);
+        }
+        final int duracion = getConfig().getInt("burbuja-segundos", 6) * 10; // ciclos de 2 ticks
+        final int[] cuenta = {0};
+        tareaBurbuja = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            if (npc == null || !npc.isSpawned() || ++cuenta[0] > duracion) {
+                quitarBurbuja();
+                return;
+            }
+            Location l = npc.getEntity().getLocation();
+            for (int i = 0; i < burbujas.size() && i < alturas.length; i++) {
+                burbujas.get(i).teleport(l.clone().add(0, alturas[i], 0));
+            }
+        }, 2L, 2L);
+    }
+
+    private void quitarBurbuja() {
+        if (tareaBurbuja != null) {
+            tareaBurbuja.cancel();
+            tareaBurbuja = null;
+        }
+        for (ArmorStand a : burbujas) a.remove();
+        burbujas.clear();
+    }
+
+    private List<String> dividir(String t, int ancho) {
+        List<String> out = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        for (String w : t.split(" ")) {
+            if (w.isEmpty()) continue;
+            if (cur.length() > 0 && cur.length() + 1 + w.length() > ancho) {
+                out.add(cur.toString());
+                cur = new StringBuilder();
+            }
+            if (cur.length() > 0) cur.append(' ');
+            cur.append(w);
+        }
+        if (cur.length() > 0) out.add(cur.toString());
+        if (out.size() > 4) {
+            out = new ArrayList<>(out.subList(0, 4));
+            out.set(3, out.get(3) + "...");
+        }
+        return out;
     }
 
     // ---------- Acciones ----------
@@ -397,6 +483,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             }
             case "remove" -> {
                 devolverTodo();
+                quitarBurbuja();
                 if (npc != null) npc.destroy();
                 npc = null;
                 s.sendMessage(nombre() + " eliminado.");
