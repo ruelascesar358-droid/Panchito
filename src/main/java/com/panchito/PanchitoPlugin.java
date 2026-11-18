@@ -157,7 +157,6 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         JsonObject rf = new JsonObject();
         rf.addProperty("type", "json_object");
         body.add("response_format", rf);
-        body.addProperty("max_tokens", 200);
         body.addProperty("temperature", 0.9);
 
         HttpRequest req = HttpRequest.newBuilder(URI.create("https://api.groq.com/openai/v1/chat/completions"))
