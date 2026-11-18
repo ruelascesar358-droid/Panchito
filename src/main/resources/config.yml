@@ -1,9 +1,12 @@
 # Clave de Groq (también puedes usar la variable de entorno GROQ_API_KEY)
-groq-key: "PON_AQUI_TU_API_KEY"
-modelo: "llama-3.3-70b-versatile"
+groq-key: "nose"
+modelo: "openai/gpt-oss-20b"
 
 # Nombre del NPC. Para hablarle, los jugadores deben incluir este nombre en el chat.
 nombre: "Panchito"
+
+skin-textura: "AQUI_EL_VALUE"
+skin-firma: "AQUI_LA_SIGNATURE"
 
 # Ataca solo a los mobs hostiles que se le acerquen
 auto-defensa: true
