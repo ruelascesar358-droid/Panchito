@@ -75,6 +75,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         if (npc != null) npc.destroy();
         npc = registry.createNPC(EntityType.PLAYER, nombre());
         npc.getNavigator().getDefaultParameters().range(64f).distanceMargin(2.5);
+        net.citizensnpcs.trait.LookClose lc = npc.getOrAddTrait(net.citizensnpcs.trait.LookClose.class); lc.lookClose(true); lc.setRange(8);
         npc.spawn(loc);
         mode = "quieto";
     }
