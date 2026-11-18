@@ -1,0 +1,15 @@
+name: Panchito
+version: 1.0.0
+main: com.panchito.PanchitoPlugin
+api-version: '26.1'
+depend: [Citizens]
+description: Panchito, un jugador NPC con IA de Groq
+commands:
+  panchito:
+    description: Administra a Panchito
+    usage: /panchito <spawn|remove|reload>
+    aliases: []
+    permission: panchito.admin
+permissions:
+  panchito.admin:
+    default: op
