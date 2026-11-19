@@ -12,6 +12,7 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.Sound;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
@@ -38,6 +39,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -57,6 +59,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     private final Map<UUID, List<ItemStack>> guardados = new HashMap<>();
     private final Set<UUID> ignorados = new HashSet<>();
     private Item objetivoItem;
+    private boolean entregando;
     private final List<ArmorStand> burbujas = new ArrayList<>();
     private BukkitTask tareaBurbuja;
     private int intentos;
@@ -142,9 +145,9 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         LivingEntity h = hostilCercano(16);
         double vida = ne instanceof LivingEntity le ? le.getHealth() : 20;
         return String.format(Locale.ROOT,
-                "vida %.0f/20, modo %s, distancia a %s: %s, mob hostil cercano: %s, objetos guardados de %s: %d",
+                "vida %.0f/20, modo %s, distancia a %s: %s, mob hostil cercano: %s, objetos guardados de %s: %s",
                 vida, mode, p.getName(), dist, h == null ? "ninguno" : h.getType().name(),
-                p.getName(), contar(p.getUniqueId()));
+                p.getName(), resumen(p.getUniqueId()));
     }
 
     private LivingEntity hostilCercano(double r) {
@@ -181,7 +184,9 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
                 + "\"atacar\" (atacar el mob hostil más cercano), \"recoger\" (ir a juntar objetos que los jugadores tiraron; "
                 + "los guardas para su dueño), \"dar\" (entregar al jugador que te habla los objetos que guardaste DE ÉL; "
                 + "nunca se los das a otro), \"saltar\", \"mirar\" (mirar al jugador), \"ninguna\" (solo hablar).\n"
-                + "Juntas solo lo que los jugadores tiran y se lo guardas a quien lo tiró. Solo se lo devuelves a su dueño.";
+                + "Juntas solo lo que los jugadores tiran y se lo guardas a quien lo tiró. Solo se lo devuelves a su dueño.\n"
+                + "Si te preguntan qué tienes guardado de ellos, dilo en español usando el campo \"objetos guardados\" del estado "
+                + "(traduce los nombres de los objetos); nunca reveles lo que guardaste de otros jugadores.";
     }
 
     private void preguntar(String user, String texto, String estado, UUID uid) {
@@ -349,6 +354,25 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     }
 
     // ---------- Recoger y devolver objetos ----------
+    // Texto con lo que Panchito guardó de un jugador, ej: "64 stone, 3 torch"
+    private String resumen(UUID dueno) {
+        List<ItemStack> l = guardados.get(dueno);
+        if (l == null || l.isEmpty()) return "nada";
+        Map<String, Integer> m = new java.util.LinkedHashMap<>();
+        for (ItemStack st : l) {
+            String n = st.getType().name().toLowerCase(Locale.ROOT).replace('_', ' ');
+            m.merge(n, st.getAmount(), Integer::sum);
+        }
+        StringBuilder sb = new StringBuilder();
+        int c = 0;
+        for (Map.Entry<String, Integer> e : m.entrySet()) {
+            if (c == 10) { sb.append(", y más"); break; }
+            if (c++ > 0) sb.append(", ");
+            sb.append(e.getValue()).append(' ').append(e.getKey());
+        }
+        return sb.toString();
+    }
+
     private int contar(UUID dueno) {
         List<ItemStack> l = guardados.get(dueno);
         if (l == null) return 0;
@@ -415,13 +439,32 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         UUID dueno = it.getThrower();
         if (dueno == null) return;
         guardados.computeIfAbsent(dueno, k -> new ArrayList<>()).add(it.getItemStack().clone());
+        ponerEnMano(it.getItemStack());
         Entity ne = npc.getEntity();
         ne.getWorld().playSound(ne.getLocation(), Sound.ENTITY_ITEM_PICKUP, 0.5f, 1f);
         it.remove();
     }
 
-    // Solo entrega al jugador que pide, y solo lo que ÉL tiró
+    // Objeto en la mano de Panchito (null = mano vacía)
+    private void ponerEnMano(ItemStack st) {
+        if (npc == null || !npc.isSpawned()) return;
+        net.citizensnpcs.api.trait.trait.Equipment eq =
+                npc.getOrAddTrait(net.citizensnpcs.api.trait.trait.Equipment.class);
+        eq.set(net.citizensnpcs.api.trait.trait.Equipment.EquipmentSlot.HAND,
+                st == null ? new ItemStack(Material.AIR) : st.clone());
+    }
+
+    private void terminarEntrega(UUID uid) {
+        List<ItemStack> g = guardados.get(uid);
+        if (g != null && g.isEmpty()) guardados.remove(uid);
+        entregando = false;
+        ponerEnMano(null);
+    }
+
+    // Solo entrega al jugador que pide, y solo lo que ÉL tiró.
+    // Cada objeto aparece primero en su mano y después se lo da.
     private void dar(Player p) {
+        if (entregando) return;
         List<ItemStack> lista = guardados.get(p.getUniqueId());
         if (lista == null || lista.isEmpty()) return;
         Entity ne = npc.getEntity();
@@ -429,15 +472,44 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             hablar("Estás muy lejos, acércate y me lo pides otra vez.");
             return;
         }
-        List<ItemStack> sobrantes = new ArrayList<>();
-        for (ItemStack st : lista) sobrantes.addAll(p.getInventory().addItem(st).values());
-        if (sobrantes.isEmpty()) {
-            guardados.remove(p.getUniqueId());
-        } else {
-            guardados.put(p.getUniqueId(), sobrantes);
-            hablar("Tu inventario está lleno, te dejo lo que sobró guardado.");
-        }
-        p.playSound(p.getLocation(), Sound.ENTITY_ITEM_PICKUP, 0.5f, 1f);
+        entregando = true;
+        final UUID uid = p.getUniqueId();
+        final Deque<ItemStack> cola = new ArrayDeque<>(lista);
+        final boolean[] enMano = {false};
+        final int[] espera = {0};
+        Bukkit.getScheduler().runTaskTimer(this, task -> {
+            Player dest = Bukkit.getPlayer(uid);
+            if (npc == null || !npc.isSpawned() || dest == null || !dest.isOnline()) {
+                task.cancel();
+                terminarEntrega(uid);
+                return;
+            }
+            if (!enMano[0]) {
+                if (cola.isEmpty()) {
+                    task.cancel();
+                    terminarEntrega(uid);
+                    return;
+                }
+                ponerEnMano(cola.peekFirst());
+                npc.faceLocation(dest.getEyeLocation());
+                enMano[0] = true;
+                espera[0] = 0;
+                return;
+            }
+            if (++espera[0] < 2) return; // lo sostiene un momento antes de dárselo
+            ItemStack st = cola.pollFirst();
+            List<ItemStack> g = guardados.computeIfAbsent(uid, k -> new ArrayList<>());
+            g.remove(st);
+            Collection<ItemStack> resto = dest.getInventory().addItem(st.clone()).values();
+            dest.playSound(dest.getLocation(), Sound.ENTITY_ITEM_PICKUP, 0.5f, 1f);
+            enMano[0] = false;
+            ponerEnMano(null);
+            if (!resto.isEmpty()) {
+                g.addAll(resto);
+                cola.clear();
+                hablar("Tu inventario está lleno, te dejo lo que sobró guardado.");
+            }
+        }, 0L, 10L);
     }
 
     // Al apagar o quitar a Panchito, nada se pierde: se devuelve o se deja en el suelo
@@ -456,6 +528,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             }
         }
         guardados.clear();
+        ponerEnMano(null);
     }
 
     private void loopDefensa() {
@@ -471,7 +544,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     @Override
     public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
         if (a.length == 0) {
-            s.sendMessage("Uso: /panchito <spawn|remove|reload>");
+            s.sendMessage("Uso: /panchito <spawn|remove|reload|inventario>");
             return true;
         }
         switch (a[0].toLowerCase(Locale.ROOT)) {
@@ -488,11 +561,21 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
                 npc = null;
                 s.sendMessage(nombre() + " eliminado.");
             }
+            case "inventario" -> {
+                if (guardados.isEmpty()) {
+                    s.sendMessage(nombre() + " no tiene nada guardado.");
+                } else {
+                    for (UUID u : guardados.keySet()) {
+                        String nom = Bukkit.getOfflinePlayer(u).getName();
+                        s.sendMessage((nom != null ? nom : u.toString()) + ": " + resumen(u));
+                    }
+                }
+            }
             case "reload" -> {
                 reloadConfig();
                 s.sendMessage("Configuración recargada.");
             }
-            default -> s.sendMessage("Uso: /panchito <spawn|remove|reload>");
+            default -> s.sendMessage("Uso: /panchito <spawn|remove|reload|inventario>");
         }
         return true;
     }
