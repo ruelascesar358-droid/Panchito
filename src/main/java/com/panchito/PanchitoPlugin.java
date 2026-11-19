@@ -26,7 +26,9 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerTeleportEvent.TeleportCause;
+import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -60,6 +62,9 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     private final Set<UUID> ignorados = new HashSet<>();
     private Item objetivoItem;
     private boolean entregando;
+    private boolean recibiendo;
+    // Regalos pendientes: destinatario -> objetos que se le entregarán cuando Panchito lo vea
+    private final Map<UUID, List<ItemStack>> regalos = new HashMap<>();
     private final List<ArmorStand> burbujas = new ArrayList<>();
     private BukkitTask tareaBurbuja;
     private int intentos;
@@ -78,6 +83,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         }, 40L);
         Bukkit.getScheduler().runTaskTimer(this, this::loopDefensa, 20L, 20L);
         Bukkit.getScheduler().runTaskTimer(this, this::loopRecoger, 10L, 10L);
+        Bukkit.getScheduler().runTaskTimer(this, this::loopRegalos, 20L, 20L);
     }
 
     @Override
@@ -145,9 +151,9 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         LivingEntity h = hostilCercano(16);
         double vida = ne instanceof LivingEntity le ? le.getHealth() : 20;
         return String.format(Locale.ROOT,
-                "vida %.0f/20, modo %s, distancia a %s: %s, mob hostil cercano: %s, objetos guardados de %s: %s",
+                "vida %.0f/20, modo %s, distancia a %s: %s, mob hostil cercano: %s, objetos guardados de %s: %s, jugadores en línea: %s",
                 vida, mode, p.getName(), dist, h == null ? "ninguno" : h.getType().name(),
-                p.getName(), resumen(p.getUniqueId()));
+                p.getName(), resumen(p.getUniqueId()), nombresEnLinea());
     }
 
     private LivingEntity hostilCercano(double r) {
@@ -179,11 +185,11 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     private String systemPrompt() {
         String base = getConfig().getString("personalidad", "").replace("{nombre}", nombre());
         return base + "\nDecides tú mismo qué hacer según lo que se te dice y el estado actual.\n"
-                + "Responde SIEMPRE y SOLO con un JSON así: {\"say\":\"texto o vacío\",\"action\":\"accion\"}\n"
+                + "Responde SIEMPRE y SOLO con un JSON así: {\"say\":\"texto o vacío\",\"action\":\"accion\",\"para\":\"solo si regalas\"}\n"
                 + "Acciones: \"seguir\" (seguir al jugador que te habla), \"quieto\" (detenerte), "
                 + "\"atacar\" (atacar el mob hostil más cercano), \"recoger\" (ir a juntar objetos que los jugadores tiraron; "
                 + "los guardas para su dueño), \"dar\" (entregar al jugador que te habla los objetos que guardaste DE ÉL; "
-                + "nunca se los das a otro), \"saltar\", \"mirar\" (mirar al jugador), \"ninguna\" (solo hablar).\n"
+                + "nunca se los das a otro), \"regalar\" (el jugador que te habla te pide dar SUS objetos guardados a otro jugador: pon en \"para\" el nombre exacto del otro jugador; se los entregas cuando lo veas cerca), \"saltar\", \"mirar\" (mirar al jugador), \"ninguna\" (solo hablar).\n"
                 + "Juntas solo lo que los jugadores tiran y se lo guardas a quien lo tiró. Solo se lo devuelves a su dueño.\n"
                 + "Si te preguntan qué tienes guardado de ellos, dilo en español usando el campo \"objetos guardados\" del estado "
                 + "(traduce los nombres de los objetos); nunca reveles lo que guardaste de otros jugadores.";
@@ -231,16 +237,17 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             final String respuesta = raw;
             Bukkit.getScheduler().runTask(this, () -> {
                 history.addLast(msg("assistant", respuesta));
-                String say = "", action = "ninguna";
+                String say = "", action = "ninguna", para = "";
                 try {
                     JsonObject j = JsonParser.parseString(respuesta).getAsJsonObject();
                     if (j.has("say") && !j.get("say").isJsonNull()) say = j.get("say").getAsString();
                     if (j.has("action") && !j.get("action").isJsonNull()) action = j.get("action").getAsString();
+                    if (j.has("para") && !j.get("para").isJsonNull()) para = j.get("para").getAsString();
                 } catch (Exception ex) {
                     say = respuesta.length() > 150 ? respuesta.substring(0, 150) : respuesta;
                 }
                 if (!say.isBlank()) hablar(say);
-                ejecutar(action.toLowerCase(Locale.ROOT), Bukkit.getPlayer(uid));
+                ejecutar(action.toLowerCase(Locale.ROOT), Bukkit.getPlayer(uid), para);
             });
         });
     }
@@ -316,6 +323,10 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
 
     // ---------- Acciones ----------
     private void ejecutar(String accion, Player p) {
+        ejecutar(accion, p, "");
+    }
+
+    private void ejecutar(String accion, Player p, String para) {
         if (npc == null || !npc.isSpawned()) return;
         Entity ne = npc.getEntity();
         switch (accion) {
@@ -344,6 +355,9 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             }
             case "dar" -> {
                 if (p != null) dar(p);
+            }
+            case "regalar" -> {
+                if (p != null) regalar(p, para);
             }
             case "saltar" -> ne.setVelocity(ne.getVelocity().add(new Vector(0, 0.45, 0)));
             case "mirar" -> {
@@ -399,7 +413,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     }
 
     private void loopRecoger() {
-        if (npc == null || !npc.isSpawned()) return;
+        if (npc == null || !npc.isSpawned() || entregando || recibiendo) return;
         boolean auto = getConfig().getBoolean("recoger-automatico", true);
         if (!(mode.equals("recogiendo") || (auto && mode.equals("quieto")))) {
             objetivoItem = null;
@@ -454,42 +468,97 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
                 st == null ? new ItemStack(Material.AIR) : st.clone());
     }
 
-    private void terminarEntrega(UUID uid) {
-        List<ItemStack> g = guardados.get(uid);
-        if (g != null && g.isEmpty()) guardados.remove(uid);
-        entregando = false;
-        ponerEnMano(null);
+    private String nombresEnLinea() {
+        StringBuilder sb = new StringBuilder();
+        int c = 0;
+        for (Player pl : Bukkit.getOnlinePlayers()) {
+            if (c++ >= 12) break;
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(pl.getName());
+        }
+        return sb.length() == 0 ? "ninguno" : sb.toString();
+    }
+
+    private boolean lejos(Player p) {
+        Entity ne = npc.getEntity();
+        return !p.getWorld().equals(ne.getWorld()) || p.getLocation().distanceSquared(ne.getLocation()) > 400;
     }
 
     // Solo entrega al jugador que pide, y solo lo que ÉL tiró.
-    // Cada objeto aparece primero en su mano y después se lo da.
     private void dar(Player p) {
-        if (entregando) return;
-        List<ItemStack> lista = guardados.get(p.getUniqueId());
+        if (entregando || recibiendo) return;
+        final UUID uid = p.getUniqueId();
+        List<ItemStack> lista = guardados.get(uid);
         if (lista == null || lista.isEmpty()) return;
-        Entity ne = npc.getEntity();
-        if (!p.getWorld().equals(ne.getWorld()) || p.getLocation().distanceSquared(ne.getLocation()) > 400) {
+        if (lejos(p)) {
             hablar("Estás muy lejos, acércate y me lo pides otra vez.");
             return;
         }
+        animarEntrega(p, lista, () -> {
+            List<ItemStack> g = guardados.get(uid);
+            if (g != null && g.isEmpty()) guardados.remove(uid);
+        });
+    }
+
+    // Un jugador le pide a Panchito dar SUS objetos a otro jugador (se los da cuando lo vea)
+    private void regalar(Player donante, String para) {
+        Player dest = null;
+        for (Player pl : Bukkit.getOnlinePlayers()) {
+            if (pl.getName().equalsIgnoreCase(para.trim())) { dest = pl; break; }
+        }
+        if (dest == null) {
+            hablar("No encuentro a " + (para.isBlank() ? "ese jugador" : para) + ".");
+            return;
+        }
+        if (dest.equals(donante)) {
+            dar(donante);
+            return;
+        }
+        List<ItemStack> mias = guardados.remove(donante.getUniqueId());
+        if (mias == null || mias.isEmpty()) {
+            hablar("No tengo nada tuyo para regalar.");
+            return;
+        }
+        regalos.computeIfAbsent(dest.getUniqueId(), k -> new ArrayList<>()).addAll(mias);
+    }
+
+    // Cuando Panchito ve al destinatario cerca, le entrega el regalo
+    private void loopRegalos() {
+        if (npc == null || !npc.isSpawned() || entregando || recibiendo || regalos.isEmpty()) return;
+        Entity ne = npc.getEntity();
+        for (Map.Entry<UUID, List<ItemStack>> en : new ArrayList<>(regalos.entrySet())) {
+            final UUID k = en.getKey();
+            Player d = Bukkit.getPlayer(k);
+            if (d == null || !d.isOnline() || !d.getWorld().equals(ne.getWorld())) continue;
+            if (d.getLocation().distanceSquared(ne.getLocation()) > 100) continue; // 10 bloques
+            if (ne instanceof LivingEntity le && !le.hasLineOfSight(d)) continue;
+            hablar("¡" + d.getName() + "! Tengo algo para ti.");
+            animarEntrega(d, en.getValue(), () -> {
+                List<ItemStack> g = regalos.get(k);
+                if (g != null && g.isEmpty()) regalos.remove(k);
+            });
+            return;
+        }
+    }
+
+    // Cada objeto aparece primero en la mano de Panchito y después se lo da al jugador
+    private void animarEntrega(Player destino, List<ItemStack> origen, Runnable alTerminar) {
         entregando = true;
-        final UUID uid = p.getUniqueId();
-        final Deque<ItemStack> cola = new ArrayDeque<>(lista);
+        final UUID uid = destino.getUniqueId();
+        final Deque<ItemStack> cola = new ArrayDeque<>(origen);
         final boolean[] enMano = {false};
         final int[] espera = {0};
         Bukkit.getScheduler().runTaskTimer(this, task -> {
             Player dest = Bukkit.getPlayer(uid);
-            if (npc == null || !npc.isSpawned() || dest == null || !dest.isOnline()) {
+            boolean invalido = npc == null || !npc.isSpawned() || dest == null || !dest.isOnline();
+            if (invalido || (!enMano[0] && cola.isEmpty())) {
                 task.cancel();
-                terminarEntrega(uid);
+                entregando = false;
+                ponerEnMano(null);
+                alTerminar.run();
                 return;
             }
             if (!enMano[0]) {
-                if (cola.isEmpty()) {
-                    task.cancel();
-                    terminarEntrega(uid);
-                    return;
-                }
                 ponerEnMano(cola.peekFirst());
                 npc.faceLocation(dest.getEyeLocation());
                 enMano[0] = true;
@@ -498,23 +567,53 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             }
             if (++espera[0] < 2) return; // lo sostiene un momento antes de dárselo
             ItemStack st = cola.pollFirst();
-            List<ItemStack> g = guardados.computeIfAbsent(uid, k -> new ArrayList<>());
-            g.remove(st);
+            origen.remove(st);
             Collection<ItemStack> resto = dest.getInventory().addItem(st.clone()).values();
             dest.playSound(dest.getLocation(), Sound.ENTITY_ITEM_PICKUP, 0.5f, 1f);
             enMano[0] = false;
             ponerEnMano(null);
             if (!resto.isEmpty()) {
-                g.addAll(resto);
+                origen.addAll(resto);
                 cola.clear();
                 hablar("Tu inventario está lleno, te dejo lo que sobró guardado.");
             }
         }, 0L, 10L);
     }
 
+    // Un jugador le da un objeto: se agacha + clic derecho sobre Panchito con el objeto en la mano
+    @EventHandler(ignoreCancelled = true)
+    public void onToca(PlayerInteractEntityEvent e) {
+        if (e.getHand() != EquipmentSlot.HAND) return;
+        if (npc == null || !npc.isSpawned()) return;
+        if (!e.getRightClicked().getUniqueId().equals(npc.getEntity().getUniqueId())) return;
+        Player p = e.getPlayer();
+        if (getConfig().getBoolean("entrega-agachado", true) && !p.isSneaking()) return;
+        ItemStack mano = p.getInventory().getItemInMainHand();
+        if (mano.getType().isAir()) return;
+        e.setCancelled(true);
+        if (entregando || recibiendo) return;
+        List<ItemStack> g = guardados.computeIfAbsent(p.getUniqueId(), k -> new ArrayList<>());
+        if (g.size() >= getConfig().getInt("max-objetos", 36)) {
+            hablar("Ya no me cabe más de lo tuyo.");
+            return;
+        }
+        final ItemStack recibido = mano.clone();
+        p.getInventory().setItemInMainHand(new ItemStack(Material.AIR));
+        g.add(recibido.clone()); // queda guardado de inmediato (así nunca se pierde)
+        recibiendo = true;
+        ponerEnMano(recibido);
+        npc.faceLocation(p.getEyeLocation());
+        p.playSound(p.getLocation(), Sound.ENTITY_ITEM_PICKUP, 0.5f, 1f);
+        hablar("¡Gracias! Lo guardo.");
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            recibiendo = false;
+            if (!entregando) ponerEnMano(null);
+        }, 30L);
+    }
+
     // Al apagar o quitar a Panchito, nada se pierde: se devuelve o se deja en el suelo
     private void devolverTodo() {
-        if (npc == null || !npc.isSpawned()) { guardados.clear(); return; }
+        if (npc == null || !npc.isSpawned()) { guardados.clear(); regalos.clear(); return; }
         Location donde = npc.getEntity().getLocation();
         for (Map.Entry<UUID, List<ItemStack>> en : guardados.entrySet()) {
             Player dueno = Bukkit.getPlayer(en.getKey());
@@ -527,6 +626,9 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
                 }
             }
         }
+        for (List<ItemStack> lst : regalos.values())
+            for (ItemStack st : lst) donde.getWorld().dropItemNaturally(donde, st);
+        regalos.clear();
         guardados.clear();
         ponerEnMano(null);
     }
