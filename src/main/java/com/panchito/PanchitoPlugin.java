@@ -11,6 +11,7 @@ import net.citizensnpcs.api.npc.NPCRegistry;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.Sound;
@@ -56,7 +57,12 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
 
     private NPCRegistry registry;
     private NPC npc;
-    private String mode = "quieto";
+    private String mode = "libre";
+    private boolean quietoFijo;       // true = alguien le ordenó quedarse quieto en su lugar
+    private Location casa;             // punto alrededor del cual pasea
+    private boolean caminando;
+    private int pausaLibre;
+    private final java.util.Random azar = new java.util.Random();
     // Objetos que Panchito guardó: dueño (quien los tiró) -> lista de objetos
     private final Map<UUID, List<ItemStack>> guardados = new HashMap<>();
     private final Set<UUID> ignorados = new HashSet<>();
@@ -84,6 +90,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         Bukkit.getScheduler().runTaskTimer(this, this::loopDefensa, 20L, 20L);
         Bukkit.getScheduler().runTaskTimer(this, this::loopRecoger, 10L, 10L);
         Bukkit.getScheduler().runTaskTimer(this, this::loopRegalos, 20L, 20L);
+        Bukkit.getScheduler().runTaskTimer(this, this::loopLibre, 20L, 20L);
     }
 
     @Override
@@ -118,7 +125,11 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             npc.getOrAddTrait(net.citizensnpcs.trait.SkinTrait.class).setSkinName(skin.trim());
         }
         npc.spawn(loc);
-        mode = "quieto";
+        quietoFijo = false;
+        mode = "libre";
+        casa = loc.clone();
+        caminando = false;
+        pausaLibre = 0;
     }
 
     // ---------- Chat (Java y Bedrock via Geyser llegan igual) ----------
@@ -139,6 +150,11 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             if (!p.getWorld().equals(ne.getWorld())
                     || p.getLocation().distanceSquared(ne.getLocation()) > radio * radio) return;
             if (!busy.compareAndSet(false, true)) return;
+            if (mode.equals("libre")) { // alguien le habla: se queda quieto un rato
+                npc.getNavigator().cancelNavigation();
+                caminando = false;
+                pausaLibre = 8;
+            }
             preguntar(user, msg, estado(p), uid);
         });
     }
@@ -186,7 +202,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         String base = getConfig().getString("personalidad", "").replace("{nombre}", nombre());
         return base + "\nDecides tú mismo qué hacer según lo que se te dice y el estado actual.\n"
                 + "Responde SIEMPRE y SOLO con un JSON así: {\"say\":\"texto o vacío\",\"action\":\"accion\",\"para\":\"solo si regalas\"}\n"
-                + "Acciones: \"seguir\" (seguir al jugador que te habla), \"quieto\" (detenerte), "
+                + "Acciones: \"seguir\" (seguir al jugador que te habla), \"quieto\" (te quedas fijo en ese lugar, sin pasear, hasta que te digan que puedes moverte), \"libre\" (ya puedes moverte: vuelves a pasear libremente), "
                 + "\"atacar\" (atacar el mob hostil más cercano), \"recoger\" (ir a juntar objetos que los jugadores tiraron; "
                 + "los guardas para su dueño), \"dar\" (entregar al jugador que te habla los objetos que guardaste DE ÉL; "
                 + "nunca se los das a otro), \"regalar\" (el jugador que te habla te pide dar SUS objetos guardados a otro jugador: pon en \"para\" el nombre exacto del otro jugador; se los entregas cuando lo veas cerca), \"saltar\", \"mirar\" (mirar al jugador), \"ninguna\" (solo hablar).\n"
@@ -334,11 +350,22 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
                 if (p == null || !p.isOnline()) return;
                 if (!p.getWorld().equals(ne.getWorld())) npc.teleport(p.getLocation(), TeleportCause.PLUGIN);
                 mode = "siguiendo";
+                caminando = false;
                 npc.getNavigator().setTarget(p, false);
             }
             case "quieto" -> {
                 mode = "quieto";
+                quietoFijo = true;
                 objetivoItem = null;
+                npc.getNavigator().cancelNavigation();
+            }
+            case "libre" -> {
+                quietoFijo = false;
+                mode = "libre";
+                objetivoItem = null;
+                casa = ne.getLocation().clone();
+                caminando = false;
+                pausaLibre = 0;
                 npc.getNavigator().cancelNavigation();
             }
             case "atacar" -> {
@@ -415,7 +442,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     private void loopRecoger() {
         if (npc == null || !npc.isSpawned() || entregando || recibiendo) return;
         boolean auto = getConfig().getBoolean("recoger-automatico", true);
-        if (!(mode.equals("recogiendo") || (auto && mode.equals("quieto")))) {
+        if (!(mode.equals("recogiendo") || (auto && mode.equals("libre")))) {
             objetivoItem = null;
             return;
         }
@@ -426,7 +453,7 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
             objetivoItem = buscarItem(getConfig().getDouble("radio-recoger", 12));
             intentos = 0;
             if (objetivoItem == null) {
-                if (mode.equals("recogiendo")) mode = "quieto";
+                if (mode.equals("recogiendo")) mode = modoReposo();
                 return;
             }
             mode = "recogiendo";
@@ -435,14 +462,14 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
         if (ne.getLocation().distanceSquared(objetivoItem.getLocation()) <= 2.25) {
             guardar(objetivoItem);
             objetivoItem = null;
-            mode = "quieto";
+            mode = modoReposo();
             npc.getNavigator().cancelNavigation();
             return;
         }
         if (++intentos > 40) { // 20 segundos sin poder llegar: lo deja
             ignorados.add(objetivoItem.getUniqueId());
             objetivoItem = null;
-            mode = "quieto";
+            mode = modoReposo();
             npc.getNavigator().cancelNavigation();
             return;
         }
@@ -636,10 +663,66 @@ public class PanchitoPlugin extends JavaPlugin implements Listener {
     private void loopDefensa() {
         if (npc == null || !npc.isSpawned() || !getConfig().getBoolean("auto-defensa", true)) return;
         if (mode.equals("atacando")) {
-            if (!npc.getNavigator().isNavigating()) mode = "quieto";
+            if (!npc.getNavigator().isNavigating()) mode = modoReposo();
             return;
         }
-        if (hostilCercano(6) != null) ejecutar("atacar", null);
+        if (!quietoFijo && hostilCercano(6) != null) ejecutar("atacar", null);
+    }
+
+    // ---------- Pasear libremente ----------
+    private String modoReposo() {
+        return quietoFijo ? "quieto" : "libre";
+    }
+
+    private Location buscarSuelo(org.bukkit.World w, int x, int z, int yRef) {
+        for (int dy : new int[]{0, 1, -1, 2, -2, 3, -3}) {
+            int y = yRef + dy;
+            org.bukkit.block.Block pies = w.getBlockAt(x, y, z);
+            if (w.getBlockAt(x, y - 1, z).isSolid() && !w.getBlockAt(x, y - 1, z).isLiquid()
+                    && pies.isPassable() && !pies.isLiquid() && w.getBlockAt(x, y + 1, z).isPassable()) {
+                return new Location(w, x + 0.5, y, z + 0.5);
+            }
+        }
+        return null;
+    }
+
+    // Panchito pasea solo; si alguien se acerca se queda quieto, y cuando se aleja sigue paseando
+    private void loopLibre() {
+        if (npc == null || !npc.isSpawned() || !mode.equals("libre") || entregando || recibiendo) return;
+        if (!getConfig().getBoolean("moverse-libre", true)) return;
+        Entity ne = npc.getEntity();
+        double rq = getConfig().getDouble("radio-quieto", 5);
+        for (Player pl : Bukkit.getOnlinePlayers()) {
+            if (pl.getGameMode() != GameMode.SPECTATOR && pl.getWorld().equals(ne.getWorld())
+                    && pl.getLocation().distanceSquared(ne.getLocation()) <= rq * rq) {
+                if (npc.getNavigator().isNavigating()) npc.getNavigator().cancelNavigation();
+                caminando = false;
+                pausaLibre = 2 + azar.nextInt(3);
+                return;
+            }
+        }
+        if (caminando) {
+            if (npc.getNavigator().isNavigating()) return;
+            caminando = false;                    // llegó (o no pudo llegar)
+            pausaLibre = 2 + azar.nextInt(5);
+            return;
+        }
+        if (pausaLibre > 0) { pausaLibre--; return; }
+        if (casa == null || !casa.getWorld().equals(ne.getWorld())) casa = ne.getLocation().clone();
+        double radio = getConfig().getDouble("radio-paseo", 8);
+        for (int i = 0; i < 6; i++) {
+            double ang = azar.nextDouble() * Math.PI * 2;
+            double dist = 2 + azar.nextDouble() * Math.max(1, radio - 2);
+            int x = (int) Math.floor(casa.getX() + Math.cos(ang) * dist);
+            int z = (int) Math.floor(casa.getZ() + Math.sin(ang) * dist);
+            Location dest = buscarSuelo(ne.getWorld(), x, z, ne.getLocation().getBlockY());
+            if (dest != null) {
+                npc.getNavigator().setTarget(dest);
+                caminando = true;
+                return;
+            }
+        }
+        pausaLibre = 3;
     }
 
     // ---------- Comandos ----------
